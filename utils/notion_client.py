@@ -135,6 +135,54 @@ def get_page_by_id(page_id: str) -> dict | None:
         return None
 
 
+def get_stale_pending_posts(hours: int = 48) -> list[dict]:
+    """Fetch posts stuck in 'Sent for approval' for longer than `hours` hours."""
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/databases/{NOTION_DATABASE_ID}/query",
+            headers=HEADERS,
+            json={
+                "filter": {
+                    "and": [
+                        {
+                            "property": "Status",
+                            "select": {"equals": "Sent for approval"},
+                        },
+                        {
+                            "timestamp": "created_time",
+                            "created_time": {"before": cutoff},
+                        },
+                    ]
+                }
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return [{"id": r["id"]} for r in resp.json().get("results", [])]
+    except Exception as e:
+        log_error(f"Notion get_stale_pending_posts error: {e}")
+        return []
+
+
+def archive_post(page_id: str) -> bool:
+    """Archive (soft-delete) a Notion page so it no longer appears in the DB."""
+    try:
+        resp = requests.patch(
+            f"{BASE_URL}/pages/{page_id}",
+            headers=HEADERS,
+            json={"archived": True},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        log_info(f"Notion page archived: {page_id}")
+        return True
+    except Exception as e:
+        log_error(f"Notion archive_post error ({page_id}): {e}")
+        return False
+
+
 def get_recent_posts(days: int = 3) -> list[dict]:
     """Fetch posts from last N days for duplicate checking."""
     from datetime import timedelta

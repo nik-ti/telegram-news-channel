@@ -44,7 +44,10 @@ from utils.config import (
 from utils.logger import log_info, log_error
 from utils.telegram_error import send_error
 from utils.state_db import init_db, is_url_processed, mark_url_processed
-from utils.notion_client import url_exists, create_post, update_post_status, get_page_by_id
+from utils.notion_client import (
+    url_exists, create_post, update_post_status, get_page_by_id,
+    get_stale_pending_posts, archive_post,
+)
 from utils.telegram_client import get_bot, publish_post_text, sanitize_telegram_html
 
 from nodes import fetch_rss, fetch_crawl
@@ -134,13 +137,6 @@ async def approve_handler(query: CallbackQuery):
         except Exception as e:
             log_error(f"[BUTTON] Failed to edit message (already posted): {e}")
         return
-    if status == "Declined":
-        try:
-            await query.message.edit_text(f"❌ Уже отклонено: {title}")
-        except Exception as e:
-            log_error(f"[BUTTON] Failed to edit message (already declined): {e}")
-        return
-
     # 5. REMOVE KEYBOARD so button can't be clicked again
     try:
         await query.message.edit_reply_markup(reply_markup=None)
@@ -202,95 +198,6 @@ async def _background_approve(query: CallbackQuery, page_id: str, page_data: dic
         try:
             await query.message.edit_text(
                 f"⚠️ <b>Ошибка публикации</b>\n\n{e}",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-
-
-@router.callback_query(F.data.startswith("decline:"))
-async def decline_handler(query: CallbackQuery):
-    """Handle Decline button press. Same pattern: answer fast, background work."""
-    page_id = query.data.split(":", 1)[1]
-    log_info(f"[BUTTON] Decline clicked for page_id={page_id}")
-
-    # 1. ACKNOWLEDGE IMMEDIATELY
-    try:
-        await query.answer("❌ Отклоняем...")
-        log_info(f"[BUTTON] query.answer() succeeded for decline:{page_id}")
-    except Exception as e:
-        log_error(f"[BUTTON] query.answer() FAILED for decline:{page_id}: {e}")
-
-    # 2. Validate we can edit the message
-    if not query.message:
-        log_error(f"[BUTTON] query.message is None for decline:{page_id}")
-        return
-
-    # 3. Fetch from Notion
-    try:
-        page_data = get_page_by_id(page_id)
-        log_info(f"[BUTTON] Notion fetch succeeded for decline {page_id}")
-    except Exception as e:
-        log_error(f"[BUTTON] Notion fetch error for decline {page_id}: {e}")
-        try:
-            await query.message.edit_text("⚠️ Ошибка: не удалось загрузить данные из Notion")
-        except Exception as e2:
-            log_error(f"[BUTTON] Failed to edit message after Notion error: {e2}")
-        return
-
-    if not page_data:
-        log_info(f"[BUTTON] page_data is None for decline {page_id}")
-        try:
-            await query.message.edit_text("⚠️ Пост не найден в Notion")
-        except Exception as e:
-            log_error(f"[BUTTON] Failed to edit message (not found): {e}")
-        return
-
-    # 4. Already handled?
-    status = page_data.get("status", "")
-    title = page_data.get("title", "Unknown")
-    log_info(f"[BUTTON] Decline status={status}, title={title}")
-
-    if status == "Posted":
-        try:
-            await query.message.edit_text(f"✅ Уже опубликовано: {title}")
-        except Exception as e:
-            log_error(f"[BUTTON] Failed to edit message (already posted): {e}")
-        return
-    if status == "Declined":
-        try:
-            await query.message.edit_text(f"❌ Уже отклонено: {title}")
-        except Exception as e:
-            log_error(f"[BUTTON] Failed to edit message (already declined): {e}")
-        return
-
-    # 5. REMOVE KEYBOARD
-    try:
-        await query.message.edit_reply_markup(reply_markup=None)
-        log_info(f"[BUTTON] Keyboard removed for decline {page_id}")
-    except Exception as e:
-        log_error(f"[BUTTON] Failed to remove keyboard for decline {page_id}: {e}")
-
-    # 6. BACKGROUND TASK
-    log_info(f"[BUTTON] Starting background decline task for {page_id}")
-    asyncio.create_task(_background_decline(query, page_id, title))
-
-
-async def _background_decline(query: CallbackQuery, page_id: str, title: str):
-    """Do the decline work in background."""
-    try:
-        update_post_status(page_id, "Declined")
-        await query.message.edit_text(
-            "❌ <b>Отклонено</b>",
-            parse_mode="HTML",
-        )
-        log_info(f"Declined: {page_id}")
-    except Exception as e:
-        log_error(f"Background decline error: {e}")
-        send_error(str(e), node_name="background_decline")
-        try:
-            await query.message.edit_text(
-                "⚠️ <b>Ошибка отклонения</b>",
                 parse_mode="HTML",
             )
         except Exception:
@@ -387,17 +294,16 @@ async def process_article(article: dict):
         )
         log_info(f"Preview sent (msg_id={msg.message_id})")
 
-        # 10. Send approval buttons as a separate reply
+        # 10. Send approval button as a separate reply
         from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve:{page_id}"),
-                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"decline:{page_id}"),
             ]
         ])
         await bot.send_message(
             chat_id=ADMIN_CHANNEL_ID,
-            text="👆 <b>Одобрить или отклонить?</b>",
+            text="👆 <b>Опубликовать?</b>",
             parse_mode="HTML",
             reply_markup=keyboard,
             reply_to_message_id=msg.message_id,
@@ -408,6 +314,16 @@ async def process_article(article: dict):
     except Exception as e:
         log_error(f"Pipeline error for {article.get('url')}: {e}")
         send_error(str(e), node_name="process_article")
+
+
+async def cleanup_stale_posts():
+    """Archive Notion posts that have been pending approval for more than 48 hours."""
+    log_info("=== Stale post cleanup started ===")
+    stale = get_stale_pending_posts(hours=48)
+    log_info(f"Found {len(stale)} stale pending post(s)")
+    for item in stale:
+        archive_post(item["id"])
+    log_info("=== Stale post cleanup complete ===")
 
 
 async def run_pipeline():
@@ -458,8 +374,15 @@ async def on_startup(app: web.Application):
         id="news_cycle",
         replace_existing=True,
     )
+    scheduler.add_job(
+        cleanup_stale_posts,
+        trigger="interval",
+        hours=6,
+        id="stale_cleanup",
+        replace_existing=True,
+    )
     scheduler.start()
-    log_info(f"Scheduler started (every {CRON_INTERVAL_MINUTES} min)")
+    log_info(f"Scheduler started (every {CRON_INTERVAL_MINUTES} min, cleanup every 6h)")
 
     # 4. Run pipeline immediately
     asyncio.create_task(run_pipeline())

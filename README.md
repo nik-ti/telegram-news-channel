@@ -6,8 +6,9 @@ A reusable Telegram news channel automation template. Copy this directory, confi
 
 - Fetches news from **RSS feeds** and **crawled websites**
 - Runs an AI pipeline: summarize → relevance check → duplicate detection → post writing
-- Sends posts to an **admin approval channel** with inline approve/decline buttons
+- Sends posts to an **admin approval channel** with a single inline Approve button
 - On approval, publishes to the **public channel**
+- Posts not approved within **48 hours** are auto-archived (cleanup runs every 6h)
 - Stores everything in **Notion** for tracking
 
 ## Architecture
@@ -33,7 +34,8 @@ Single Process (aiohttp + aiogram + APScheduler)
     │       ↓
     │   Telegram admin channel (inline keyboard)
     │
-    └── aiogram webhook → approve/decline handlers
+    └── aiogram webhook → approve handler
+        (posts ignored for 48h are auto-archived by cleanup job)
 ```
 
 ## How to create a new channel
