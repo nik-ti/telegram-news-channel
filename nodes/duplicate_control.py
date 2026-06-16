@@ -6,7 +6,7 @@ TEMPERATURE: 0.2
 """
 
 from utils.openrouter import chat_completion
-from utils.notion_client import get_recent_posts
+from utils.state_db import get_recent_posts
 from utils.logger import log_info, log_error
 
 MODEL = "google/gemini-2.5-flash"

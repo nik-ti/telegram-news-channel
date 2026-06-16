@@ -40,15 +40,18 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from utils.config import (
     TELEGRAM_BOT_TOKEN, WEBHOOK_HOST, WEBHOOK_PATH, WEBHOOK_PORT,
     CRON_INTERVAL_MINUTES, ADMIN_CHANNEL_ID, MAIN_CHANNEL_ID,
+    IMAGE_GENERATION_ENABLED,
 )
 from utils.logger import log_info, log_error
 from utils.telegram_error import send_error
-from utils.state_db import init_db, is_url_processed, mark_url_processed
-from utils.notion_client import (
+from utils.state_db import (
+    init_db, is_url_processed, mark_url_processed,
+    save_image_file_id, get_image_file_id, delete_image_file_id,
     url_exists, create_post, update_post_status, get_page_by_id,
     get_stale_pending_posts, archive_post,
 )
-from utils.telegram_client import get_bot, publish_post_text, sanitize_telegram_html
+from utils.telegram_client import get_bot, publish_post_text, publish_post_with_image, sanitize_telegram_html
+from utils.image_generator import generate_image
 
 from nodes import fetch_rss, fetch_crawl
 from nodes.summarizer import execute as summarize
@@ -106,22 +109,22 @@ async def approve_handler(query: CallbackQuery):
         log_error(f"[BUTTON] query.message is None for approve:{page_id}")
         return
 
-    # 3. Fetch page data from Notion (stateless — works after restarts)
+    # 3. Fetch page data from DB (stateless — works after restarts)
     try:
         page_data = get_page_by_id(page_id)
-        log_info(f"[BUTTON] Notion fetch succeeded for {page_id}")
+        log_info(f"[BUTTON] DB fetch succeeded for {page_id}")
     except Exception as e:
-        log_error(f"[BUTTON] Notion fetch error for {page_id}: {e}")
+        log_error(f"[BUTTON] DB fetch error for {page_id}: {e}")
         try:
-            await query.message.edit_text("⚠️ Ошибка: не удалось загрузить данные из Notion")
+            await query.message.edit_text("⚠️ Ошибка: не удалось загрузить данные поста")
         except Exception as e2:
-            log_error(f"[BUTTON] Failed to edit message after Notion error: {e2}")
+            log_error(f"[BUTTON] Failed to edit message after DB error: {e2}")
         return
 
     if not page_data:
         log_info(f"[BUTTON] page_data is None for {page_id}")
         try:
-            await query.message.edit_text("⚠️ Пост не найден в Notion")
+            await query.message.edit_text("⚠️ Пост не найден")
         except Exception as e:
             log_error(f"[BUTTON] Failed to edit message (not found): {e}")
         return
@@ -174,20 +177,25 @@ async def _background_approve(query: CallbackQuery, page_id: str, page_data: dic
             )
             return
 
-        # Publish to main channel
+        # Publish to main channel (with image if one was generated)
         log_info(f"[BUTTON] Publishing post for {page_id}")
-        post_url = await publish_post_text(post_text)
+        image_file_id = get_image_file_id(page_id)
+        if image_file_id:
+            post_url = await publish_post_with_image(post_text, image_file_id)
+            delete_image_file_id(page_id)
+        else:
+            post_url = await publish_post_text(post_text)
         log_info(f"[BUTTON] Post published: {post_url}")
 
-        # Update Notion
+        # Update DB status
         update_post_status(page_id, "Posted", post_url)
-        log_info(f"[BUTTON] Notion updated to Posted for {page_id}")
+        log_info(f"[BUTTON] DB updated to Posted for {page_id}")
 
         # Final edit on admin message
         await query.message.edit_text(
             f"✅ <b>Опубликовано</b>\n\n{post_url}",
             parse_mode="HTML",
-            disable_web_page_preview=False,
+            disable_web_page_preview=True,
         )
 
         log_info(f"Approved & posted: {page_id} → {post_url}")
@@ -215,10 +223,9 @@ async def process_article(article: dict):
         url = article.get("url", "N/A")
         log_info(f"Processing: {url}")
 
-        # 1. URL dedup via Notion
+        # 1. URL dedup
         if url_exists(url):
-            log_info("URL already in Notion, skipping")
-            mark_url_processed(url, article.get("source", "unknown"), article.get("title", ""))
+            log_info("URL already processed, skipping")
             return
 
         # 2. Validate data
@@ -264,14 +271,14 @@ async def process_article(article: dict):
             log_info("Empty title or post_text, skipping")
             return
 
-        # 8. Create Notion row
+        # 8. Save post to DB
         article_date = article.get("date", "")
         if "T" in article_date:
             article_date = article_date.split("T")[0]
         if not article_date:
             article_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-        notion_page = create_post(
+        db_page = create_post(
             title=title,
             post_text=post_text,
             source_url=url,
@@ -280,7 +287,7 @@ async def process_article(article: dict):
             status="Sent for approval",
             post_type="News",
         )
-        page_id = notion_page["id"]
+        page_id = db_page["id"]
 
         # 9. Send preview to admin channel
         bot = get_bot()
@@ -294,13 +301,12 @@ async def process_article(article: dict):
         )
         log_info(f"Preview sent (msg_id={msg.message_id})")
 
-        # 10. Send approval button as a separate reply
+        # 10. Send approval button(s) as a separate reply
         from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve:{page_id}"),
-            ]
-        ])
+        row = [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve:{page_id}")]
+        if IMAGE_GENERATION_ENABLED:
+            row.append(InlineKeyboardButton(text="🎨 Картинка", callback_data=f"generate_image:{page_id}"))
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[row])
         await bot.send_message(
             chat_id=ADMIN_CHANNEL_ID,
             text="👆 <b>Опубликовать?</b>",
@@ -316,8 +322,83 @@ async def process_article(article: dict):
         send_error(str(e), node_name="process_article")
 
 
+@router.callback_query(F.data.startswith("generate_image:"))
+async def generate_image_handler(query: CallbackQuery):
+    """Handle Generate Image button. Acknowledge immediately, do work in background."""
+    page_id = query.data.split(":", 1)[1]
+    log_info(f"[BUTTON] Generate image clicked for page_id={page_id}")
+
+    try:
+        await query.answer("🎨 Генерируем...")
+    except Exception as e:
+        log_error(f"[BUTTON] query.answer() FAILED for generate_image:{page_id}: {e}")
+
+    if not query.message:
+        return
+
+    try:
+        await query.message.edit_text("🎨 <b>Генерация изображения...</b>", parse_mode="HTML")
+    except Exception as e:
+        log_error(f"[BUTTON] Failed to show generating state: {e}")
+
+    asyncio.create_task(_background_generate_image(query, page_id))
+
+
+async def _background_generate_image(query: CallbackQuery, page_id: str):
+    """Generate an image and send it to the admin channel as a new approvable message."""
+    try:
+        page_data = get_page_by_id(page_id)
+        if not page_data:
+            await query.message.edit_text("⚠️ Пост не найден")
+            return
+
+        post_text = page_data.get("post_text", "")
+        image_bytes = await generate_image(post_text)
+        if not image_bytes:
+            await query.message.edit_text(
+                "⚠️ <b>Ошибка генерации изображения</b>\n(API ключ или промпт не настроены)",
+                parse_mode="HTML",
+            )
+            return
+
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
+        photo = BufferedInputFile(image_bytes, filename="image.jpg")
+        safe_post = sanitize_telegram_html(post_text)
+        approve_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Одобрить с картинкой", callback_data=f"approve:{page_id}"),
+        ]])
+
+        bot = get_bot()
+        sent = await bot.send_photo(
+            chat_id=ADMIN_CHANNEL_ID,
+            photo=photo,
+            caption=safe_post[:1024],
+            parse_mode="HTML",
+            reply_markup=approve_keyboard,
+        )
+
+        # Store Telegram file_id in SQLite so _background_approve can use it
+        file_id = sent.photo[-1].file_id
+        save_image_file_id(page_id, file_id)
+        log_info(f"[BUTTON] Image generated and sent for {page_id}")
+
+        # Remove buttons from the original message
+        await query.message.edit_text("🎨 <b>Изображение сгенерировано</b> ↑", parse_mode="HTML")
+
+    except Exception as e:
+        log_error(f"Background generate_image error: {e}")
+        send_error(str(e), node_name="background_generate_image")
+        try:
+            await query.message.edit_text(
+                "⚠️ <b>Ошибка генерации изображения</b>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+
 async def cleanup_stale_posts():
-    """Archive Notion posts that have been pending approval for more than 48 hours."""
+    """Delete posts that have been pending approval for more than 48 hours."""
     log_info("=== Stale post cleanup started ===")
     stale = get_stale_pending_posts(hours=48)
     log_info(f"Found {len(stale)} stale pending post(s)")

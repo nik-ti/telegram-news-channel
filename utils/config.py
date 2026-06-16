@@ -24,6 +24,8 @@ CRON_INTERVAL_MINUTES = int(os.getenv("CRON_INTERVAL_MINUTES", "60"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 DATA_DIR = os.getenv("DATA_DIR", "./data")
 SAFE_MODE = os.getenv("SAFE_MODE", "false").lower() == "true"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+IMAGE_GENERATION_ENABLED = os.getenv("IMAGE_GENERATION_ENABLED", "false").lower() == "true"
 
 # Proxy config for blocked sources
 PROXY_SERVER = os.getenv("PROXY_SERVER", "")

@@ -68,6 +68,35 @@ async def _send_message_safe(bot: Bot, chat_id: str, text: str, **kwargs) -> obj
         raise
 
 
+async def publish_post_with_image(post_text: str, file_id: str) -> str:
+    """Publish a post with an image to the main channel. Returns Telegram post URL."""
+    bot = get_bot()
+    target = ADMIN_CHANNEL_ID if SAFE_MODE else MAIN_CHANNEL_ID
+    target_name = "ADMIN (SAFE MODE)" if SAFE_MODE else MAIN_CHANNEL_ID
+
+    try:
+        msg = await bot.send_photo(
+            chat_id=target,
+            photo=file_id,
+            caption=sanitize_telegram_html(post_text)[:1024],
+            parse_mode="HTML",
+        )
+
+        url_base = MAIN_CHANNEL_ID if not SAFE_MODE else ADMIN_CHANNEL_ID
+        if url_base.startswith("@"):
+            post_url = f"https://t.me/{url_base.lstrip('@')}/{msg.message_id}"
+        else:
+            cid = url_base.replace("-100", "")
+            post_url = f"https://t.me/c/{cid}/{msg.message_id}"
+
+        log_info(f"Published post with image to {target_name}: {post_url}")
+        return post_url
+
+    except Exception as e:
+        log_error(f"Failed to publish post with image: {e}")
+        raise
+
+
 async def publish_post_text(post_text: str) -> str:
     """Publish a text-only post to the main channel. Returns Telegram post URL."""
     bot = get_bot()
